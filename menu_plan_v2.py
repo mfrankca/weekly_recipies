@@ -1188,4 +1188,24 @@ def build_pdf():
 
 
 if __name__ == "__main__":
+    import argparse
+    import json
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Render the saved menu or a freshly AI-generated JSON plan.")
+    parser.add_argument("--plan", type=Path, help="JSON file from generate_recipes.py")
+    args = parser.parse_args()
+    if args.plan:
+        from generate_recipes import renderer_data
+        try:
+            plan = renderer_data(json.loads(args.plan.read_text(encoding="utf-8")))
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            parser.error(f"Cannot load plan: {exc}")
+        WEEK = plan["WEEK"]
+        DAYS = plan["DAYS"]
+        MACRO_DATA = plan["MACRO_DATA"]
+        SHOPPING = plan["SHOPPING"]
+        BUDGET = plan["BUDGET"]
+        MEAL_PREP = plan["MEAL_PREP"]
+        LEFTOVERS = plan["LEFTOVERS"]
     build_pdf()

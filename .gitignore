@@ -1,9 +1,13 @@
 # Sensitive — never commit
 gmail_mcp/
 recipients.txt
+.env
+.env.*
+!.env.example
 
 # Generated output — not source
 *.pdf
+generated_menu_*.json
 
 # Python
 __pycache__/
