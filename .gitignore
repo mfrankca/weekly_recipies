@@ -1,0 +1,15 @@
+# Sensitive — never commit
+gmail_mcp/
+recipients.txt
+
+# Generated output — not source
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+
+# Stray/test files
+test.txt
+_synctest.txt
+pdf_base64.txt

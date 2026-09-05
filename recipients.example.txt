@@ -1,0 +1,19 @@
+# Weekly Menu Plan — Recipients
+# ─────────────────────────────
+# TO:  Marina (always the sender/recipient — do not remove)
+# BCC: Everyone else — they won't see each other's addresses
+#
+# To add someone:  add their email on a new line under [BCC]
+# To remove someone: delete their line or add a # at the start to comment it out
+# Lines starting with # are ignored
+#
+# Copy this file to recipients.txt and fill in real addresses.
+# recipients.txt is gitignored and never committed.
+
+[TO]
+you@example.com
+
+[BCC]
+# Add recipients below, one email per line, e.g:
+#family1@example.com
+#family2@example.com
