@@ -48,10 +48,16 @@ class ModelOutputError(ValueError):
     """A completed API request whose model output cannot be consumed."""
 
 
-def ask_json(key, prompt, schema=None):
+def ask_json(key, prompt, schema=None, validator=None):
     for attempt in range(3):
         try:
-            return _ask_json_once(key, prompt, schema)
+            parsed, model = _ask_json_once(key, prompt, schema)
+            if validator:
+                try:
+                    parsed = validator(parsed)
+                except ValueError as exc:
+                    raise ModelOutputError(f"Invalid model output: {exc}") from exc
+            return parsed, model
         except ModelOutputError:
             if attempt == 2:
                 raise
@@ -110,12 +116,19 @@ def require_text(value, label):
 
 def normalize_meal(meal):
     """Preserve timing detail when a provider ignores the string schema."""
+    if isinstance(meal, dict) and isinstance(meal.get("drink"), dict):
+        drink = meal["drink"]
+        if drink and all(isinstance(v, str) and v.strip() for v in drink.values()):
+            meal["drink"] = " | ".join(f"{k.replace('_', ' ').title()}: {v}" for k, v in drink.items())
     if isinstance(meal, dict) and isinstance(meal.get("time"), dict):
         timing = meal["time"]
         if timing and all(isinstance(v, (str, int, float)) and not isinstance(v, bool) for v in timing.values()):
             meal["time"] = " | ".join(f"{k.replace('_', ' ').title()}: {v}" for k, v in timing.items())
     if isinstance(meal, dict) and isinstance(meal.get("nutrition"), dict):
         nutrition = meal["nutrition"]
+        for field in ["protein", "carbs", "fat"]:
+            if field not in nutrition and field + "_g" in nutrition:
+                nutrition[field] = nutrition[field + "_g"]
         for field in ["kcal", "protein", "carbs", "fat"]:
             value = nutrition.get(field)
             if isinstance(value, str):
@@ -130,6 +143,34 @@ def require_list(value, label):
         raise ValueError(f"{label} must be a nonempty list.")
 
 
+def validate_generated_meal(meal, kind):
+    meal = normalize_meal(meal)
+    validate_meal(meal, kind)
+    return meal
+
+
+def validate_meal(meal, kind):
+    if not isinstance(meal, dict) or meal.get("type") != kind or meal.get("servings") != 4:
+        raise ValueError("Meals must be breakfast, lunch and dinner, each serving four.")
+    for field in ["name", "subtitle", "time"]:
+        require_text(meal.get(field), field)
+    for field in ["ingredients", "method"]:
+        require_list(meal.get(field), field)
+        for item in meal[field]:
+            require_text(item, field)
+    nutrition = meal.get("nutrition")
+    if not isinstance(nutrition, dict):
+        raise ValueError("Missing per-serving nutrition estimates.")
+    for field in ["kcal", "protein", "carbs", "fat"]:
+        number = nutrition.get(field)
+        if type(number) not in (int, float) or not 0 <= number < 10000:
+            raise ValueError(f"Invalid nutrition value: {field} ({number!r}).")
+    if nutrition["kcal"] <= 0:
+        raise ValueError("Calories must be positive.")
+    if kind == "DINNER" or meal.get("drink") is not None:
+        require_text(meal.get("drink"), "drink")
+
+
 def validate_day(day, expected_day, expected_cuisine):
     if not isinstance(day, dict) or day.get("day") != expected_day or day.get("cuisine") != expected_cuisine:
         raise ValueError("Generated day or cuisine does not match the request.")
@@ -138,25 +179,7 @@ def validate_day(day, expected_day, expected_cuisine):
     if not isinstance(meals, list) or len(meals) != 3:
         raise ValueError("Each day must contain three meals.")
     for meal, kind in zip(meals, ["BREAKFAST", "LUNCH", "DINNER"]):
-        if not isinstance(meal, dict) or meal.get("type") != kind or meal.get("servings") != 4:
-            raise ValueError("Meals must be breakfast, lunch and dinner, each serving four.")
-        for field in ["name", "subtitle", "time"]:
-            require_text(meal.get(field), field)
-        for field in ["ingredients", "method"]:
-            require_list(meal.get(field), field)
-            for item in meal[field]:
-                require_text(item, field)
-        nutrition = meal.get("nutrition")
-        if not isinstance(nutrition, dict):
-            raise ValueError("Missing per-serving nutrition estimates.")
-        for field in ["kcal", "protein", "carbs", "fat"]:
-            number = nutrition.get(field)
-            if type(number) not in (int, float) or not 0 <= number < 10000:
-                raise ValueError(f"Invalid nutrition value: {field} ({number!r}).")
-        if nutrition["kcal"] <= 0:
-            raise ValueError("Calories must be positive.")
-        if kind == "DINNER" or meal.get("drink") is not None:
-            require_text(meal.get("drink"), "drink")
+        validate_meal(meal, kind)
 
 
 def validate_plan(plan):
@@ -245,8 +268,8 @@ method (list of unnumbered step strings), nutrition (numeric kcal, protein, carb
 and drink (null except dinner must include a drink pairing with a nonalcoholic option).
 Nutrition is estimated. Do not claim recipes are sourced from websites. No HTML or Markdown in values.
 """
-            meal, model = ask_json(key, prompt, schema=meal_schema(kind))
-            meal = normalize_meal(meal)
+            meal, model = ask_json(key, prompt, schema=meal_schema(kind),
+                                   validator=lambda value: validate_generated_meal(value, kind))
             day["meals"].append(meal)
             models.append(model)
             if draft_path:

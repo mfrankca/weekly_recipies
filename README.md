@@ -34,7 +34,7 @@ python -u .\menu_plan_v2.py --plan '.\generated_menu_<exact filename printed abo
 
 Use the same JSON for the full email recipes. Inspect the PDF before delivery, especially long recipe cards. If the free service fails or returns invalid data, generation stops without saving a usable menu or falling back to old recipes. Model requests contain recipe requirements and generated food data, not recipients or archived plans.
 
-Malformed or truncated model responses get at most two additional free attempts per request; authentication and quota errors stop immediately. Returned recipes are saved to a `.partial.json` draft while generation runs. Partial drafts are not complete plans and must not be rendered or sent.
+Malformed, truncated or structurally invalid recipe responses get at most two additional free attempts per request; authentication and quota errors stop immediately. Each recipe is normalized and validated before saving: gram-suffixed nutrition keys and structured timing/drink fields are accepted without inventing missing values. Validated recipes are saved to a `.partial.json` draft while generation runs. Partial drafts are not complete plans and must not be rendered or sent.
 
 The scripts do not install a scheduler. For an existing authorized weekly task, follow `SKILL.md` and run generation before rendering. The live connection and individual recipe generation have succeeded, but a complete seven-day run has not yet passed: free-provider output errors interrupted the tests. Offline tests cover formatting, totals, bounded retries and error handling. Keep weekly delivery supervised until a complete menu and PDF pass review.
 

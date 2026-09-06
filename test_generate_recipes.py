@@ -103,6 +103,33 @@ class GenerationTests(unittest.TestCase):
         meal = generator.normalize_meal({"nutrition": {"protein": "20 g", "carbs": "~30g", "fat": "unknown", "kcal": "400 kcal"}})
         self.assertEqual(meal["nutrition"], {"protein": 20.0, "carbs": 30.0, "fat": "unknown", "kcal": 400.0})
 
+    def test_actual_provider_nutrition_aliases(self):
+        meal = day_fixture("Tuesday", "Filipino")["meals"][2]
+        meal["nutrition"] = {"kcal": 645, "protein_g": 42, "carbs_g": 58, "fat_g": 24}
+        validated = generator.validate_generated_meal(meal, "DINNER")
+        self.assertEqual([validated["nutrition"][k] for k in ["protein", "carbs", "fat"]], [42, 58, 24])
+
+    def test_structured_drink_preserves_all_instructions(self):
+        meal = generator.normalize_meal({"drink": {"name": "Cooler", "nonalcoholic_option": "Mix 30 ml juice with 200 ml water.", "serving_note": "Serve over ice."}})
+        self.assertEqual(meal["drink"], "Name: Cooler | Nonalcoholic Option: Mix 30 ml juice with 200 ml water. | Serving Note: Serve over ice.")
+
+    def test_missing_nutrition_retries_only_current_recipe(self):
+        good = day_fixture("Monday", "Greek")["meals"][0]
+        bad = json.loads(json.dumps(good))
+        del bad["nutrition"]["protein"]
+        with patch.object(generator, "_ask_json_once", side_effect=[(bad, "free"), (good, "free")]) as request:
+            value, _ = generator.ask_json("test-key", "Recipe", validator=lambda meal: generator.validate_generated_meal(meal, "BREAKFAST"))
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(value["nutrition"]["protein"], 20)
+
+    def test_missing_nutrition_stops_after_three_attempts(self):
+        bad = day_fixture("Monday", "Greek")["meals"][0]
+        del bad["nutrition"]["protein"]
+        with patch.object(generator, "_ask_json_once", return_value=(bad, "free")) as request:
+            with self.assertRaisesRegex(generator.ModelOutputError, "protein"):
+                generator.ask_json("test-key", "Recipe", validator=lambda meal: generator.validate_generated_meal(meal, "BREAKFAST"))
+        self.assertEqual(request.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
