@@ -8,6 +8,7 @@ recipients.txt
 # Generated output — not source
 *.pdf
 generated_menu_*.json
+tmp/pdfs/
 
 # Python
 __pycache__/

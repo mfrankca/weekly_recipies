@@ -3,7 +3,7 @@
 Weekly Menu Plan PDF Generator — v3 (full redesign)
 Marina's Sunday meal planner
 ─────────────────────────────────────────────────
-• Two-column recipe cards (ingredients | method)
+• Complete recipes with natural page continuation
 • Minimum 8 pt body text — nothing cramped or overlapping
 • Brand-new recipes generated fresh each week
 ─────────────────────────────────────────────────
@@ -24,6 +24,18 @@ from reportlab.platypus import (
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.pdfgen import canvas
 from datetime import datetime
+
+# Embed Unicode fonts for accented recipe names and symbols on Windows.
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+_font_dir = os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts")
+_font_files = {"Helvetica": "arial.ttf", "Helvetica-Bold": "arialbd.ttf",
+               "Helvetica-Oblique": "ariali.ttf", "Helvetica-BoldOblique": "arialbi.ttf"}
+if all(os.path.isfile(os.path.join(_font_dir, f)) for f in _font_files.values()):
+    for alias, filename in _font_files.items():
+        pdfmetrics.registerFont(TTFont(alias, os.path.join(_font_dir, filename)))
+    pdfmetrics.registerFontFamily("Helvetica", normal="Helvetica", bold="Helvetica-Bold",
+                                  italic="Helvetica-Oblique", boldItalic="Helvetica-BoldOblique")
 
 # ── UPDATE THIS EACH WEEK ─────────────────────────────────────────────────────
 WEEK = "September 7–13, 2026"
@@ -49,7 +61,7 @@ MUTED     = colors.HexColor("#6B7280")   # grey subtitles
 
 PAGE_W, PAGE_H = A4
 MARGIN    = 1.5 * cm
-USABLE_W  = PAGE_W - 2 * MARGIN         # ≈ 510 pt ≈ 18 cm
+USABLE_W  = PAGE_W - 2 * MARGIN - 12         # ≈ 510 pt ≈ 18 cm
 
 # Column split for two-column recipe cards
 ING_W  = USABLE_W * 0.40   # ingredients  ≈ 204 pt
@@ -62,7 +74,7 @@ def s(base="Normal", **kw):
     return ParagraphStyle(f"_s{_n[0]}", parent=getSampleStyleSheet()[base], **kw)
 
 def P(text, style):
-    return Paragraph(str(text), style)
+    return Paragraph(str(text).replace("\u2011", "-"), style)
 
 # ── HEADER / FOOTER CANVAS ────────────────────────────────────────────────────
 class HFCanvas(canvas.Canvas):
@@ -760,6 +772,7 @@ def cover_page(week, days):
         ], bg))
 
     col_w = [3.2 * cm, 10.5 * cm, 4.3 * cm]
+    col_w = [w * USABLE_W / sum(col_w) for w in col_w]
     grid_rows = [r for r, _ in grid_data]
     grid = Table(grid_rows, colWidths=col_w)
     style_cmds = [
@@ -812,6 +825,7 @@ def weekly_overview(days):
         rows.append(row)
 
     col_w = [3.5 * cm, 4.5 * cm, 4.5 * cm, 4.5 * cm, 1.5 * cm]
+    col_w = [w * USABLE_W / sum(col_w) for w in col_w]
     t = Table(rows, colWidths=col_w, repeatRows=1)
     ts = [
         ("BACKGROUND",    (0, 0), (-1, 0), FOREST),
@@ -901,10 +915,13 @@ def day_pages(days):
     sub_sty   = s(fontName="Helvetica-Oblique", fontSize=8.5, textColor=MUTED,   spaceAfter=3)
     mac_sty   = s(fontName="Helvetica-Bold",    fontSize=8,   textColor=SAGE,    spaceAfter=3)
     ing_hdr   = s(fontName="Helvetica-Bold",    fontSize=8,   textColor=FOREST,  spaceAfter=3)
-    ing_sty   = s(fontName="Helvetica",         fontSize=8,   textColor=TEXT,    leftIndent=6, spaceAfter=2)
+    ing_sty   = s(fontName="Helvetica",         fontSize=9, leading=12, textColor=TEXT, leftIndent=6, spaceAfter=3)
     mth_hdr   = s(fontName="Helvetica-Bold",    fontSize=8,   textColor=FOREST,  spaceAfter=3)
-    mth_sty   = s(fontName="Helvetica",         fontSize=8,   textColor=TEXT,    leftIndent=6, spaceAfter=3)
+    mth_sty   = s(fontName="Helvetica",         fontSize=9, leading=13, textColor=TEXT, leftIndent=6, spaceAfter=5)
     drk_sty   = s(fontName="Helvetica-Oblique", fontSize=8,   textColor=NAVY,    spaceAfter=2)
+
+    for sty in [name_sty, sub_sty, mac_sty, ing_hdr, mth_hdr]:
+        sty.keepWithNext = True
 
     for d in days:
         # ── day banner
@@ -941,65 +958,28 @@ def day_pages(days):
                 ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
             ]))
 
+            type_bar.keepWithNext = True
+
             # ── kcal + name + subtitle + macros (full width header block)
             header_block = [
                 type_bar,
-                Spacer(1, 0.15 * cm),
                 P(f"{meal['name']}  <font color='#C47A1A' size='9'>{meal['kcal']} kcal</font>", name_sty),
                 P(meal["subtitle"], sub_sty),
                 P(meal["macros"], mac_sty),
             ]
 
-            # ── two-column: ingredients (left) | method (right)
-            ing_content  = [P("INGREDIENTS", ing_hdr)]
+            # Native flowables can split across pages; never wrap a full recipe
+            # in one table row. Keep only the short heading with its first item.
+            elems.extend(header_block)
+            elems.append(P("INGREDIENTS (4 servings)", ing_hdr))
             for ing in meal["ingredients"]:
-                ing_content.append(P(f"• {ing}", ing_sty))
-
-            mth_content  = [P("METHOD", mth_hdr)]
+                elems.append(P(f"• {ing}", ing_sty))
+            elems.append(Spacer(1, 0.2 * cm))
+            elems.append(P("STEP-BY-STEP INSTRUCTIONS", mth_hdr))
             for i, step in enumerate(meal["method"], 1):
-                mth_content.append(P(f"{i}.  {step}", mth_sty))
-
-            two_col = Table(
-                [[ing_content, mth_content]],
-                colWidths=[ING_W, METH_W],
-            )
-            two_col.setStyle(TableStyle([
-                ("VALIGN",        (0, 0), (-1, -1), "TOP"),
-                ("TOPPADDING",    (0, 0), (-1, -1), 6),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ("LEFTPADDING",   (0, 0), (-1, -1), 8),
-                ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
-                ("LINEAFTER",     (0, 0), (0, -1),  0.5, BORDER),
-                ("BACKGROUND",    (0, 0), (-1, -1), CARD_BG),
-            ]))
-
-            card_content = header_block + [two_col]
-
+                elems.append(P(f"<b>{i}.</b>  {step}", mth_sty))
             if meal.get("drink"):
-                card_content.append(Spacer(1, 0.1 * cm))
-                card_content.append(
-                    Table([[P(f"Drink pairing:  {meal['drink']}", drk_sty)]],
-                          colWidths=[USABLE_W])
-                )
-                card_content[-1].setStyle(TableStyle([
-                    ("BACKGROUND",    (0, 0), (-1, -1), colors.HexColor("#EEF4FF")),
-                    ("TOPPADDING",    (0, 0), (-1, -1), 5),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-                    ("LEFTPADDING",   (0, 0), (-1, -1), 10),
-                    ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
-                ]))
-
-            # wrap in outer card with border
-            outer = Table([[card_content]], colWidths=[USABLE_W])
-            outer.setStyle(TableStyle([
-                ("BOX",           (0, 0), (-1, -1), 0.6, BORDER),
-                ("TOPPADDING",    (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
-                ("BACKGROUND",    (0, 0), (-1, -1), CARD_BG),
-            ]))
-            elems.append(KeepTogether(outer))
+                elems.append(P(f"<b>Drink pairing:</b> {meal['drink']}", drk_sty))
             elems.append(Spacer(1, 0.3 * cm))
 
         elems.append(PageBreak())
@@ -1010,52 +990,20 @@ def day_pages(days):
 def shopping_page(shopping):
     elems = section_header("Shopping List", "All quantities for 3–4 people for the full week")
 
-    # 3-column grid
-    CATS = list(shopping.keys())
-    COL_W = (USABLE_W - 0.4 * cm) / 3
-
-    cat_hdr  = s(fontName="Helvetica-Bold", fontSize=8.5, textColor=WHITE)
-    item_sty = s(fontName="Helvetica",      fontSize=7.5, textColor=TEXT, leftIndent=5, spaceAfter=2)
-
-    def cat_block(cat):
-        if cat is None:
-            return Spacer(1, 0.1 * cm)
-        rows = [[P(cat, cat_hdr)]]
-        for item in shopping[cat]:
-            rows.append([P(f"• {item}", item_sty)])
-        t = Table(rows, colWidths=[COL_W])
-        t.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, 0), SAGE),
-            ("TOPPADDING",    (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 7),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
-            ("BOX",           (0, 0), (-1, -1), 0.3, GREY_MD),
+    heading = s(fontName="Helvetica-Bold", fontSize=9, leading=12, textColor=WHITE)
+    item_style = s(fontName="Helvetica", fontSize=9, leading=12, textColor=TEXT)
+    for category, items in shopping.items():
+        rows = [[P(category, heading)]] + [[P(f"• {item}", item_style)] for item in items]
+        table = Table(rows, colWidths=[USABLE_W], repeatRows=1, splitByRow=1, splitInRow=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), SAGE),
+            ("BACKGROUND", (0, 1), (-1, -1), CARD_BG),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ]))
-        return t
-
-    triplets = []
-    for i in range(0, len(CATS), 3):
-        triplets.append((
-            CATS[i],
-            CATS[i + 1] if i + 1 < len(CATS) else None,
-            CATS[i + 2] if i + 2 < len(CATS) else None,
-        ))
-
-    for a, b, c in triplets:
-        row = Table(
-            [[cat_block(a), cat_block(b), cat_block(c)]],
-            colWidths=[COL_W, COL_W, COL_W],
-        )
-        row.setStyle(TableStyle([
-            ("VALIGN",       (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING",  (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-            ("TOPPADDING",   (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING",(0, 0), (-1, -1), 0),
-        ]))
-        elems.append(KeepTogether(row))
-        elems.append(Spacer(1, 0.2 * cm))
+        elems.extend([table, Spacer(1, 0.25 * cm)])
 
     elems.append(PageBreak())
     return elems
@@ -1141,6 +1089,7 @@ def macro_page(data):
                  P(f"~{tk}",      TV), P(f"{tp} g",    TV), P(f"{tc} g",    TV), P(f"{tf} g",    TV)])
 
     col_w = [2.8 * cm, 3.5 * cm, 2.6 * cm, 2.4 * cm, 2.2 * cm, 2.2 * cm, 2.3 * cm]
+    col_w = [w * USABLE_W / sum(col_w) for w in col_w]
     t = Table(rows, colWidths=col_w, repeatRows=1)
     ts = [
         ("BACKGROUND",    (0, 0),  (-1, 0),  FOREST),

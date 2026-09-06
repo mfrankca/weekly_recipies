@@ -130,6 +130,56 @@ class GenerationTests(unittest.TestCase):
                 generator.ask_json("test-key", "Recipe", validator=lambda meal: generator.validate_generated_meal(meal, "BREAKFAST"))
         self.assertEqual(request.call_count, 3)
 
+    def test_unsupported_request_settings_retry_without_them(self):
+        error_body = {"error": {"message": "Provider returned error", "metadata": {"raw": json.dumps({"error": {"message": "reasoning is mandatory and cannot be disabled"}})}}}
+        failure = HTTPError(generator.ENDPOINT, 400, "Bad Request", {}, io.BytesIO(json.dumps(error_body).encode()))
+        good = day_fixture("Monday", "Greek")["meals"][0]
+        response = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(good)}}]}
+        with patch.object(generator, "urlopen", side_effect=[failure, io.BytesIO(json.dumps(response).encode())]) as opener:
+            meal, _ = generator.ask_json("test-key", "Recipe", schema=generator.meal_schema("BREAKFAST"), validator=lambda value: generator.validate_generated_meal(value, "BREAKFAST"))
+        self.assertEqual(meal["name"], good["name"])
+        retry = json.loads(opener.call_args_list[1].args[0].data)
+        self.assertEqual(retry["model"], "openrouter/free")
+        self.assertNotIn("reasoning", retry)
+        self.assertNotIn("response_format", retry)
+        self.assertIn("schema", retry["messages"][1]["content"])
+
+    def test_unknown_400_stops_and_redacts_key(self):
+        body = {"error": {"message": "Invalid input test-secret"}}
+        failure = HTTPError(generator.ENDPOINT, 400, "Bad Request", {}, io.BytesIO(json.dumps(body).encode()))
+        with patch.object(generator, "urlopen", side_effect=failure) as opener:
+            with self.assertRaisesRegex(ValueError, "Invalid input") as caught:
+                generator.ask_json("test-secret", "Recipe")
+        self.assertEqual(opener.call_count, 1)
+        self.assertNotIn("test-secret", str(caught.exception))
+
+    def test_duplicate_recipe_retries_before_saving(self):
+        bad = day_fixture("Monday", "Greek")["meals"][0]
+        good = json.loads(json.dumps(bad))
+        good["name"] = "Different dish"
+        with patch.object(generator, "_ask_json_once", side_effect=[(bad, "free"), (good, "free")]) as request:
+            meal, _ = generator.ask_json("key", "Recipe", validator=lambda value: generator.validate_generated_meal(value, "BREAKFAST", [bad["name"].upper()]))
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(meal["name"], "Different dish")
+
+    def test_resume_replaces_only_duplicate_and_rebuilds_support(self):
+        draft = self.make_plan()
+        draft["WEEK"] = "September 07, 2026 – September 13, 2026"
+        draft["DAYS"][6]["meals"][2]["name"] = draft["DAYS"][6]["meals"][1]["name"]
+        replacement = day_fixture("Sunday", "French")["meals"][2]
+        with patch.object(generator, "ask_json", side_effect=[(replacement, "free"), (support_fixture(), "free")]) as request:
+            plan = generator.generate("key", date(2026, 9, 7), generator.CUISINES[:7], resume=draft)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(plan["DAYS"][0]["meals"], draft["DAYS"][0]["meals"])
+        self.assertIn(draft["DAYS"][6]["meals"][1]["name"], request.call_args_list[0].args[1])
+        generator.validate_plan(plan)
+
+    def test_resume_rejects_wrong_week_without_api_call(self):
+        with patch.object(generator, "ask_json") as request:
+            with self.assertRaisesRegex(ValueError, "week"):
+                generator.generate("key", date(2026, 9, 7), generator.CUISINES[:7], resume=self.make_plan())
+        request.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

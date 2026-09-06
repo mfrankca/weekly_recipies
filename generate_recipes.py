@@ -48,23 +48,65 @@ class ModelOutputError(ValueError):
     """A completed API request whose model output cannot be consumed."""
 
 
+class RequestCompatibilityError(ValueError):
+    """The provider explicitly rejected optional formatting/reasoning settings."""
+
+
+def api_error_detail(exc, key):
+    """Extract error messages only, redact credentials, never print raw bodies."""
+    messages = []
+    try:
+        payload = json.loads(exc.read(16384))
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        if isinstance(error, dict):
+            if isinstance(error.get("message"), str):
+                messages.append(error["message"])
+            metadata = error.get("metadata", {})
+            raw = metadata.get("raw") if isinstance(metadata, dict) else None
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    raw = None
+            if isinstance(raw, dict):
+                nested = raw.get("error", raw)
+                if isinstance(nested, dict) and isinstance(nested.get("message"), str):
+                    messages.append(nested["message"])
+    except (ValueError, OSError, TypeError):
+        pass
+    detail = " | ".join(messages)
+    if key:
+        detail = detail.replace(key, "[redacted]")
+    detail = re.sub(r"(?i)bearer\s+\S+|sk-or-[A-Za-z0-9_-]+", "[redacted]", detail)
+    return " ".join(detail.split())[:700] or "The provider supplied no readable error explanation."
+
+
 def ask_json(key, prompt, schema=None, validator=None):
+    compatibility = False
     for attempt in range(3):
         try:
-            parsed, model = _ask_json_once(key, prompt, schema)
+            if compatibility:
+                parsed, model = _ask_json_once(key, prompt, schema, compatibility=True)
+            else:
+                parsed, model = _ask_json_once(key, prompt, schema)
             if validator:
                 try:
                     parsed = validator(parsed)
                 except ValueError as exc:
                     raise ModelOutputError(f"Invalid model output: {exc}") from exc
             return parsed, model
+        except RequestCompatibilityError as exc:
+            if compatibility or attempt == 2:
+                raise
+            compatibility = True
+            print(f"{exc}\nRetrying with basic JSON instructions on the free router; recipe validation remains enabled.", flush=True)
         except ModelOutputError:
             if attempt == 2:
                 raise
             print("Model output was incomplete or malformed; retrying this request on the free router.", flush=True)
 
 
-def _ask_json_once(key, prompt, schema=None):
+def _ask_json_once(key, prompt, schema=None, compatibility=False):
     payload = {
         "model": MODEL,
         "messages": [
@@ -78,6 +120,11 @@ def _ask_json_once(key, prompt, schema=None):
     if schema:
         payload["response_format"] = {"type": "json_schema", "json_schema": {
             "name": "recipe", "strict": True, "schema": schema}}
+    if compatibility:
+        payload.pop("response_format", None)
+        payload.pop("reasoning", None)
+        if schema:
+            payload["messages"][1]["content"] += "\nReturn JSON matching this schema: " + json.dumps(schema)
     request = Request(ENDPOINT, data=json.dumps(payload).encode("utf-8"), headers={
         "Authorization": "Bearer " + key,
         "Content-Type": "application/json",
@@ -86,8 +133,11 @@ def _ask_json_once(key, prompt, schema=None):
         with urlopen(request, timeout=180) as response:
             result = json.load(response)
     except HTTPError as exc:
-        # Do not print response bodies or headers that could expose credentials.
-        raise ValueError(f"Free-model request failed (HTTP {exc.code}). Check the API key, free quota and service availability; no fallback was used.") from None
+        detail = api_error_detail(exc, key)
+        message = f"Free-model request failed (HTTP {exc.code}): {detail}"
+        if exc.code == 400 and re.search(r"reasoning|json_schema|response_format|structured output", detail, re.I) and re.search(r"unsupported|not support|cannot|must|invalid|mandatory|disable|not allowed", detail, re.I):
+            raise RequestCompatibilityError(message) from None
+        raise ValueError(message + " No paid model was used.") from None
     except (URLError, TimeoutError) as exc:
         raise ValueError(f"Free-model connection failed ({type(exc).__name__}); no fallback was used.") from None
     choices = result.get("choices") or []
@@ -143,9 +193,15 @@ def require_list(value, label):
         raise ValueError(f"{label} must be a nonempty list.")
 
 
-def validate_generated_meal(meal, kind):
+def dish_key(name):
+    return " ".join(name.casefold().split())
+
+
+def validate_generated_meal(meal, kind, existing_names=()):
     meal = normalize_meal(meal)
     validate_meal(meal, kind)
+    if dish_key(meal["name"]) in {dish_key(name) for name in existing_names}:
+        raise ValueError(f"Duplicate dish: {meal['name']}. Choose a different dish, not a renamed version.")
     return meal
 
 
@@ -197,7 +253,7 @@ def validate_plan(plan):
         validate_day(day, label, day["cuisine"])
         cuisines.add(day["cuisine"].strip().casefold())
         for meal in day["meals"]:
-            name = " ".join(meal["name"].casefold().split())
+            name = dish_key(meal["name"])
             if name in names:
                 raise ValueError("Duplicate dish in the generated week.")
             names.add(name)
@@ -245,22 +301,46 @@ def renderer_data(plan):
     return plan
 
 
-def generate(key, monday, cuisines, draft_path=None):
+def generate(key, monday, cuisines, draft_path=None, resume=None):
     # Only the recipe-detail section is sent; recipient and delivery instructions stay local.
     skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
     details = skill.split("#### Recipe detail standard", 1)[1].split("#### Content checks", 1)[0]
     week = f"{monday:%B %d, %Y} – {monday + timedelta(days=6):%B %d, %Y}"
+    if resume and resume.get("WEEK") != week:
+        raise ValueError("Resume draft week does not match --week-start.")
+    saved_days = resume.get("DAYS", []) if resume else []
+    if not isinstance(saved_days, list) or len(saved_days) > 7:
+        raise ValueError("Invalid resume draft days.")
+    for index, saved in enumerate(saved_days):
+        if not isinstance(saved, dict) or saved.get("day") != DAYS[index] or saved.get("cuisine") != cuisines[index]:
+            raise ValueError("Resume draft day/cuisine does not match the requested plan.")
+        if not isinstance(saved.get("meals"), list) or len(saved["meals"]) > 3:
+            raise ValueError("Invalid resume draft meals.")
     batch = uuid.uuid4().hex
     days, models = [], []
-    for label, cuisine in zip(DAYS, cuisines):
+    selected_names = []
+    for day_index, (label, cuisine) in enumerate(zip(DAYS, cuisines)):
         day = {"day": label, "cuisine": cuisine, "flag": cuisine[:2].upper(), "meals": []}
-        for kind in ["BREAKFAST", "LUNCH", "DINNER"]:
+        saved_meals = saved_days[day_index]["meals"] if day_index < len(saved_days) else []
+        for meal_index, kind in enumerate(["BREAKFAST", "LUNCH", "DINNER"]):
+            if meal_index < len(saved_meals):
+                try:
+                    saved_meal = validate_generated_meal(saved_meals[meal_index], kind, selected_names)
+                except ValueError as exc:
+                    print(f"Replacing saved {label} {kind.lower()}: {exc}", flush=True)
+                else:
+                    day["meals"].append(saved_meal)
+                    selected_names.append(saved_meal["name"])
+                    models.append("retained from explicit resume draft")
+                    print(f"Keeping {label} {kind.lower()}", flush=True)
+                    continue
             print(f"Generating {label}: {cuisine} {kind.lower()}", flush=True)
             prompt = f"""Generate one fresh {cuisine} {kind.lower()} recipe for {label}, week {week}.
 Creative batch identifier: {batch}. Explore regional and less-common dishes; do not use a fixed weekly menu rotation.
 Four servings per recipe. No pork or shellfish/molluscs/crustaceans; finfish and meat allowed.
 Give measured ingredients and complete sequential cooking instructions, not summaries.
-Choose a dish different from these already selected today: {[meal['name'] for meal in day['meals']]}.
+Choose a dish different from ALL these already selected this week: {selected_names}.
+Do not repeat or merely rename any of them.
 Use these recipe requirements: {details}
 Return ONE meal object, not a day or a list. It has type ({kind}), servings (4), name, subtitle, time
 (prep, cook, marinating if relevant and total elapsed time), ingredients (list of measured plain-text ingredients),
@@ -269,12 +349,14 @@ and drink (null except dinner must include a drink pairing with a nonalcoholic o
 Nutrition is estimated. Do not claim recipes are sourced from websites. No HTML or Markdown in values.
 """
             meal, model = ask_json(key, prompt, schema=meal_schema(kind),
-                                   validator=lambda value: validate_generated_meal(value, kind))
+                                   validator=lambda value: validate_generated_meal(value, kind, selected_names))
             day["meals"].append(meal)
+            selected_names.append(meal["name"])
             models.append(model)
             if draft_path:
                 draft_path.write_text(json.dumps({"status": "incomplete draft, not for rendering or delivery",
-                    "WEEK": week, "DAYS": days + [day], "models": models}, ensure_ascii=False, indent=2), encoding="utf-8")
+                    "WEEK": week, "DAYS": days + [day], "models": models,
+                    "cuisines": cuisines}, ensure_ascii=False, indent=2), encoding="utf-8")
         validate_day(day, label, cuisine)
         days.append(day)
     print("Generating shopping list, budget and preparation schedule", flush=True)
@@ -298,11 +380,26 @@ def main():
     parser.add_argument("--week-start", type=date.fromisoformat, help="Target Monday, YYYY-MM-DD; default is the next Monday")
     parser.add_argument("--cuisines", nargs=7, help="Seven distinct cuisines; default: randomly select seven from a broad cuisine list")
     parser.add_argument("--output", type=Path, help="New JSON output path (existing files are never overwritten)")
+    parser.add_argument("--resume", type=Path, help="Continue an explicit partial draft, keeping valid distinct recipes")
     args = parser.parse_args()
     monday = args.week_start or date.today() + timedelta(days=(7 - date.today().weekday()) % 7 or 7)
     if monday.weekday() != 0:
         parser.error("--week-start must be a Monday")
     cuisines = args.cuisines or random.SystemRandom().sample(CUISINES, 7)
+    resume = None
+    if args.resume:
+        try:
+            resume = json.loads(args.resume.read_text(encoding="utf-8"))
+            if not isinstance(resume, dict):
+                raise ValueError("Draft must be an object")
+            saved_cuisines = resume.get("cuisines") or [day["cuisine"] for day in resume["DAYS"]]
+            if not isinstance(saved_cuisines, list) or len(saved_cuisines) != 7 or not all(isinstance(c, str) for c in saved_cuisines):
+                raise ValueError("Resume draft must record all seven cuisines")
+            if args.cuisines and args.cuisines != saved_cuisines:
+                raise ValueError("--cuisines must match the resume draft")
+            cuisines = saved_cuisines
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            parser.error(f"Cannot resume draft: {exc}")
     if len({c.strip().casefold() for c in cuisines}) != 7 or any(not c.strip() for c in cuisines):
         parser.error("Provide seven distinct, nonempty cuisines")
     output = args.output or ROOT / f"generated_menu_{monday.isoformat()}_{uuid.uuid4().hex[:8]}.json"
@@ -313,7 +410,7 @@ def main():
         parser.error("Set OPENROUTER_API_KEY locally first; do not put the key in chat or source files")
     try:
         draft_path = output.with_suffix(".partial.json")
-        plan = generate(key, monday, cuisines, draft_path=draft_path)
+        plan = generate(key, monday, cuisines, draft_path=draft_path, resume=resume)
         with output.open("x", encoding="utf-8") as stream:
             json.dump(plan, stream, ensure_ascii=False, indent=2)
     except (ValueError, OSError, KeyError, IndexError, TypeError) as exc:

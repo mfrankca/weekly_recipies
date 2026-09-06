@@ -36,7 +36,17 @@ Use the same JSON for the full email recipes. Inspect the PDF before delivery, e
 
 Malformed, truncated or structurally invalid recipe responses get at most two additional free attempts per request; authentication and quota errors stop immediately. Each recipe is normalized and validated before saving: gram-suffixed nutrition keys and structured timing/drink fields are accepted without inventing missing values. Validated recipes are saved to a `.partial.json` draft while generation runs. Partial drafts are not complete plans and must not be rendered or sent.
 
-The scripts do not install a scheduler. For an existing authorized weekly task, follow `SKILL.md` and run generation before rendering. The live connection and individual recipe generation have succeeded, but a complete seven-day run has not yet passed: free-provider output errors interrupted the tests. Offline tests cover formatting, totals, bounded retries and error handling. Keep weekly delivery supervised until a complete menu and PDF pass review.
+HTTP errors now include the provider's explanation with the API key redacted. If HTTP 400 explicitly identifies unsupported formatting or reasoning settings, a retry uses basic JSON instructions on the same free router, with local recipe validation retained. Other HTTP 400 errors stop for diagnosis. Compatibility retries share the same three-attempt limit; there is no switch to paid models.
+
+Duplicate dish names are checked against all meals already selected in the current week, before saving each recipe. To continue a failed run without regenerating its valid recipes, pass its exact draft path:
+
+```powershell
+python -u .\generate_recipes.py --week-start 2026-09-07 --resume '.\generated_menu_2026-09-07_EXACT_ID.partial.json'
+```
+
+Resume validates the week and cuisines, retains valid distinct meals, replaces invalid or repeated ones, and regenerates the shopping/preparation data. It saves to a new output file. This is recovery of an explicitly selected run, not selection from recipe history. Older drafts can be resumed if they contain all seven days; newer drafts record all seven cuisines even when interrupted earlier.
+
+The scripts do not install a scheduler. For an existing authorized weekly task, follow `SKILL.md` and run generation before rendering. A complete seven-day menu has now been generated using resume, and its 48-page PDF built and visually checked. All 708 ingredient and method entries were verified in the PDF text. This verifies generation and layout, not culinary accuracy or unattended service reliability; recipe content still needs review before delivery.
 
 ## Render the legacy embedded plan
 
@@ -51,7 +61,7 @@ The script prints the saved path, `Weekly_Menu_Plan_YYYY-MM-DD.pdf`, using the g
 ## Review findings and remaining improvements
 
 - **Current recipe content:** the saved recipes still contain four short method steps apiece and many unmeasured ingredients. Expand all 21 recipes to the updated standard during the next menu revision. Updating the skill does not rewrite existing recipes or archived PDFs.
-- **Long recipe layout:** recipe cards are nested single-row tables kept together. Detailed recipes may exceed a page; support continuation when expanding them. The overview table totals 18.5 cm and the macro table 18.0 cm, exceeding the approximately 18.0 cm content frame (the macro table slightly); derive widths from `USABLE_W`.
+- **Long recipe layout (fixed):** ingredients and numbered methods flow across pages at 9 pt, shopping categories split with repeated headings, and overview/macro widths fit the content frame. A regression test covers recipes and shopping categories larger than one page. Windows Arial fonts are embedded when available for accented names.
 - **Shopping and nutrition consistency:** shopping quantities and macro tables are maintained separately from recipes. For example, Tuesday's sukiyaki lists tofu, but the shopping list omits it. Add validation or derive shared totals from structured ingredient and nutrition data.
 - **Preparation schedule:** the existing weekend guide mixes meals from different points in the week and makes broad storage claims. Use dated preparation tasks and verified storage guidance in the next plan.
 - **Reproducible setup:** dependency manifests are missing, and ignoring all of `gmail_mcp/` also excludes its reusable server code. Separate integration source from private credentials before tracking that code, and document dependencies.
